@@ -112,7 +112,7 @@ selected_stocks = st.sidebar.multiselect("Choose stocks", all_stocks, default=["
 show_predictions = st.sidebar.checkbox("Show AI Predictions", value=True)
 
 # Graph Visualization
-st.subheader(f"📊 AI-Powered Stock Analysis for {', '.join(selected_stocks)}")
+st.subheader(f"AI-Powered Stock Analysis for {', '.join(selected_stocks)}")
 fig = go.Figure()
 
 for stock in selected_stocks:
@@ -186,7 +186,7 @@ sentiment_emoji = "🟢" if market_sentiment > 0 else "🔴" if market_sentiment
 st.subheader(f"📢 AI Market Sentiment: {sentiment_emoji} {market_sentiment:.2f}")
 
 # Trending Stocks
-st.subheader("🔥 Live Trending Stocks")
+st.subheader("Live Trending Stocks")
 trending_stocks = scrape_google_news("Trending Stocks")
 for news, url in trending_stocks:
     st.markdown(f"📌 [{news}]({url})")
