@@ -1,7 +1,8 @@
 streamlit
 yfinance
-numpy
+curl_cffi
 pandas
+numpy
 tensorflow
 nltk
 requests
