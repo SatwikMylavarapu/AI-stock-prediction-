@@ -1,5 +1,5 @@
 streamlit
-yfinance
+yfinance>=1.2.50
 numpy
 pandas
 tensorflow
@@ -9,3 +9,4 @@ beautifulsoup4
 scikit-learn
 plotly
 lxml
+scipy
