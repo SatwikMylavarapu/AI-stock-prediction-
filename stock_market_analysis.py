@@ -2,7 +2,7 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from curl_cffi import requests as curlr  # The critical new import
+from curl_cffi import requests as curlr
 import requests
 from bs4 import BeautifulSoup
 import nltk
@@ -13,7 +13,7 @@ from tensorflow.keras import Input
 from sklearn.preprocessing import MinMaxScaler
 import plotly.graph_objects as go
 
-# --- NLTK Setup ---
+# --- Setup ---
 try:
     nltk.data.find('vader_lexicon')
 except LookupError:
@@ -21,98 +21,95 @@ except LookupError:
 
 sia = SentimentIntensityAnalyzer()
 
-# --- THE FIX: Custom curl_cffi session ---
 @st.cache_resource
 def get_yf_session():
-    # yfinance now specifically looks for a curl_cffi session to bypass 429s
-    session = curlr.Session(impersonate="chrome")
-    return session
+    return curlr.Session(impersonate="chrome")
 
 @st.cache_data
 def load_stock_list():
+    # Scrapes the S&P 500 (which contains all Dow 30 companies)
     url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-    # Wikipedia also likes the browser impersonation
     try:
         response = curlr.get(url, impersonate="chrome")
         sp500 = pd.read_html(response.text)[0]
-        return sp500["Symbol"].tolist()
+        return sorted(sp500["Symbol"].tolist())
     except:
-        return ["AAPL", "MSFT", "GOOGL", "AMZN", "TSLA"]
+        return ["AAPL", "MSFT", "GOOGL", "AMZN", "TSLA", "NVDA", "UNH", "V", "JPM", "HD"]
 
-# --- Data Fetching ---
 def get_stock_data(ticker):
     session = get_yf_session()
-    # We pass the curl_cffi session directly
     stock = yf.Ticker(ticker, session=session)
-    data = stock.history(period="5y")
-    return data
+    return stock.history(period="5y")
 
 def get_stock_fundamentals(ticker):
     session = get_yf_session()
     stock = yf.Ticker(ticker, session=session)
-    # Using fast_info or basic info blocks
     info = stock.info
     return info.get("trailingPE"), info.get("forwardPE")
 
-# --- UI & Logic ---
-st.set_page_config(page_title="AI Stock Dashboard", layout="wide")
+# --- UI Layout ---
+st.set_page_config(page_title="AI Market Analyzer", layout="wide")
 st.title("📈 AI-Powered Stock Market Analysis")
 
-stocks = load_stock_list()
-selected = st.sidebar.multiselect("Select Stocks", stocks, default=["AAPL", "MSFT"])
+# --- NEW: Hidden Explanation Section ---
+with st.expander("ℹ️ How to understand this data (P/E Ratios Explained)"):
+    st.markdown("""
+    ### What is a P/E Ratio?
+    The **Price-to-Earnings (P/E)** ratio tells you how much investors are willing to pay for every $1 of company profit.
+    
+    * **Trailing P/E (The Past):** Calculated using earnings from the **last 12 months**. It's based on hard facts but doesn't show where the company is going.
+    * **Forward P/E (The Future):** Based on **predicted earnings** for the next 12 months. It's an estimate of growth.
+    
+    **Cheat Sheet:**
+    * **Low (0-15):** Often "Value" stocks or companies in slow-growth industries. Could be a bargain or a sign of trouble.
+    * **Average (16-25):** The standard range for healthy, established companies.
+    * **High (25+):** "Growth" stocks. Investors expect big things in the future. High risk, but high potential.
+    """)
+
+# --- Sidebar ---
+all_symbols = load_stock_list()
+selected = st.sidebar.multiselect(
+    "Select Stocks (S&P 500 & Dow Jones)", 
+    all_symbols, 
+    default=["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA"]
+)
 show_pred = st.sidebar.checkbox("Show AI Forecast", value=True)
 
 if selected:
     fig = go.Figure()
+    metrics = []
+    
     for s in selected:
         with st.spinner(f"Fetching {s}..."):
             df = get_stock_data(s)
-            
             if df.empty:
-                st.error(f"Could not retrieve data for {s}. Yahoo is still rate-limiting.")
+                st.error(f"Could not retrieve data for {s}.")
                 continue
-                
-            fig.add_trace(go.Candlestick(
-                x=df.index, open=df['Open'], high=df['High'], 
-                low=df['Low'], close=df['Close'], name=s
-            ))
             
-            # Simple AI Prediction logic
+            fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name=s))
+            
+            pe, fpe = get_stock_fundamentals(s)
+            metrics.append({
+                "Ticker": s, 
+                "Price": round(df['Close'].iloc[-1], 2),
+                "Trailing P/E": pe, 
+                "Forward P/E": fpe,
+                "Status": "Growth" if (pe and pe > 25) else "Value"
+            })
+            
             if show_pred and len(df) > 60:
-                # Scaler & Model setup
                 scaler = MinMaxScaler()
                 scaled = scaler.fit_transform(df["Close"].values.reshape(-1, 1))
-                
-                # Use only last 60 days for a quick live prediction
                 last_60 = scaled[-60:].reshape(1, 60, 1)
                 
-                # Define a lightweight model to avoid OOM on Streamlit
-                model = Sequential([
-                    Input(shape=(60, 1)),
-                    LSTM(50, return_sequences=False),
-                    Dense(1)
-                ])
+                model = Sequential([Input(shape=(60, 1)), LSTM(50), Dense(1)])
                 model.compile(optimizer='adam', loss='mse')
-                # Note: In a real app, you'd load a pre-trained weights file here
-                # For this one-shot fix, we show the structure
-                
                 pred_scaled = model.predict(last_60, verbose=0)
                 p = scaler.inverse_transform(pred_scaled)
                 
                 tmrw = df.index[-1] + pd.Timedelta(days=1)
-                fig.add_trace(go.Scatter(
-                    x=[df.index[-1], tmrw], 
-                    y=[df["Close"].iloc[-1], p[0][0]], 
-                    mode="lines+markers", name=f"{s} Forecast",
-                    line=dict(dash='dash')
-                ))
+                fig.add_trace(go.Scatter(x=[df.index[-1], tmrw], y=[df["Close"].iloc[-1], p[0][0]], mode="lines+markers", name=f"{s} Forecast", line=dict(dash='dash')))
     
     st.plotly_chart(fig, use_container_width=True)
-
-    # Fundamentals Table
-    st.subheader("📊 Market Metrics")
-    metrics = []
-    for s in selected:
-        pe, fpe = get_stock_fundamentals(s)
-        metrics.append({"Ticker": s, "Trailing P/E": pe, "Forward P/E": fpe})
+    st.subheader("📊 Market Metrics Comparison")
     st.table(pd.DataFrame(metrics))
