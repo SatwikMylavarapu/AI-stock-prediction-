@@ -8,35 +8,48 @@ import nltk
 from nltk.sentiment import SentimentIntensityAnalyzer
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Dropout
+from tensorflow.keras import Input
 from sklearn.preprocessing import MinMaxScaler
 import plotly.graph_objects as go
-from tensorflow.keras import Input
 import plotly.express as px
 
-nltk.download('vader_lexicon')
+# Download NLTK data
+try:
+    nltk.data.find('vader_lexicon')
+except LookupError:
+    nltk.download('vader_lexicon')
 
 # Initialize Sentiment Analyzer
 sia = SentimentIntensityAnalyzer()
 
-# Fetch stock list from Wikipedia
+# FIX: Fetch stock list with Headers to avoid HTTP 403 error
 @st.cache_data
 def load_stock_list():
     url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-    sp500 = pd.read_html(url)[0]
-    return sp500["Symbol"].tolist()
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+    }
+    try:
+        response = requests.get(url, headers=headers)
+        sp500 = pd.read_html(response.text)[0]
+        return sp500["Symbol"].tolist()
+    except Exception as e:
+        st.error(f"Error fetching stock list: {e}")
+        return ["AAPL", "MSFT", "GOOGL", "AMZN", "TSLA"]
 
 # Fetch stock data
-def get_stock_data(ticker="AAPL"):
+def get_stock_data(ticker):
     stock = yf.Ticker(ticker)
-    data = stock.history(period="30y")
+    data = stock.history(period="5y") # Reduced from 30y to 5y for faster LSTM training
     return data
 
 # Fetch stock fundamentals
-def get_stock_fundamentals(ticker="AAPL"):
+def get_stock_fundamentals(ticker):
     stock = yf.Ticker(ticker)
     info = stock.info
     pe_ratio = info.get("trailingPE", None)
-    industry_pe = info.get("forwardPE", None)  # Fetch industry P/E dynamically
+    # Using forwardPE as a proxy for industry average if not available
+    industry_pe = info.get("forwardPE", None)  
     return pe_ratio, industry_pe
 
 # Check if stock is overpriced
@@ -45,41 +58,46 @@ def is_stock_overpriced(pe_ratio, industry_avg):
         return "Unknown (No Data)"
     return "✅ Fair" if pe_ratio < industry_avg else "🚨 Overpriced"
 
-# Stock volatility calculation (log returns)
+# Stock volatility calculation
 def calculate_volatility(data):
+    if data.empty: return 0
     return np.std(np.log(data["Close"] / data["Close"].shift(1))) * 100
 
-# Scrape news headlines for sentiment analysis
+# Scrape news headlines
 def scrape_google_news(query="Stock Market"):
     url = f"https://www.google.com/search?q={query}&tbm=nws"
     headers = {"User-Agent": "Mozilla/5.0"}
     
-    response = requests.get(url, headers=headers)
-    soup = BeautifulSoup(response.text, "html.parser")
-    articles = soup.find_all("div", class_="BNeawe vvjwJb AP7Wnd")
+    try:
+        response = requests.get(url, headers=headers)
+        soup = BeautifulSoup(response.text, "html.parser")
+        articles = soup.find_all("div", class_="BNeawe vvjwJb AP7Wnd")
 
-    news_results = []
-    for article in articles[:5]:
-        title = article.text
-        parent = article.find_parent("a")
-        link = f"https://www.google.com{parent['href']}" if parent and "href" in parent.attrs else "No Link Available"
-        news_results.append((title, link))
-    
-    return news_results if news_results else []
+        news_results = []
+        for article in articles[:5]:
+            title = article.text
+            parent = article.find_parent("a")
+            link = f"https://www.google.com{parent['href']}" if parent and "href" in parent.attrs else "#"
+            news_results.append((title, link))
+        return news_results
+    except:
+        return []
 
-# Sentiment analysis of financial news
+# Sentiment analysis
 def analyze_sentiment(news_list):
+    if not news_list: return 0
     sentiment_scores = [sia.polarity_scores(news[0])["compound"] for news in news_list]
-    avg_sentiment = np.mean(sentiment_scores) if sentiment_scores else 0
-    return avg_sentiment
+    return np.mean(sentiment_scores)
 
-# Train LSTM model for stock price prediction
-def train_lstm_model(data):
+# OPTIMIZED: Cache the model training so it doesn't run on every UI interaction
+@st.cache_resource
+def train_lstm_model(data_close_values):
     scaler = MinMaxScaler(feature_range=(0, 1))
-    scaled_data = scaler.fit_transform(data["Close"].values.reshape(-1, 1))
+    scaled_data = scaler.fit_transform(data_close_values.reshape(-1, 1))
 
     X_train, y_train = [], []
-    for i in range(60, len(scaled_data) - 1):
+    # Using 60 days of lookback
+    for i in range(60, len(scaled_data)):
         X_train.append(scaled_data[i-60:i, 0])
         y_train.append(scaled_data[i, 0])
     
@@ -97,96 +115,98 @@ def train_lstm_model(data):
     ])
 
     model.compile(optimizer='adam', loss='mean_squared_error')
-    model.fit(X_train, y_train, epochs=10, batch_size=32, verbose=0)
+    model.fit(X_train, y_train, epochs=5, batch_size=32, verbose=0) # Reduced epochs for speed
     
     return model, scaler
 
-# Streamlit UI
+# --- Streamlit UI ---
 st.set_page_config(page_title="📈 AI Stock Market Dashboard", layout="wide")
 st.title("📈 AI-Powered Stock Market Analysis")
 
-# Sidebar Selection
+# Sidebar
 st.sidebar.header("🔎 Select Stock(s)")
 all_stocks = load_stock_list()
-selected_stocks = st.sidebar.multiselect("Choose stocks", all_stocks, default=["AAPL", "MSFT", "GOOGL"])
+selected_stocks = st.sidebar.multiselect("Choose stocks", all_stocks, default=["AAPL", "MSFT"])
 show_predictions = st.sidebar.checkbox("Show AI Predictions", value=True)
 
-# Graph Visualization
-st.subheader(f"AI-Powered Stock Analysis for {', '.join(selected_stocks)}")
-fig = go.Figure()
+if not selected_stocks:
+    st.warning("Please select at least one stock from the sidebar.")
+else:
+    # Graph Visualization
+    st.subheader(f"Analysis for: {', '.join(selected_stocks)}")
+    fig = go.Figure()
 
-for stock in selected_stocks:
-    stock_data = get_stock_data(stock)
+    for stock in selected_stocks:
+        with st.spinner(f"Processing {stock}..."):
+            stock_data = get_stock_data(stock)
+            if stock_data.empty:
+                st.error(f"No data found for {stock}")
+                continue
+
+            # Candlestick
+            fig.add_trace(go.Candlestick(
+                x=stock_data.index, open=stock_data['Open'],
+                high=stock_data['High'], low=stock_data['Low'],
+                close=stock_data['Close'], name=f"{stock} Hist"
+            ))
+
+            # MAs
+            stock_data["MA_50"] = stock_data["Close"].rolling(window=50).mean()
+            fig.add_trace(go.Scatter(x=stock_data.index, y=stock_data["MA_50"], name=f"{stock} 50-Day MA", line=dict(width=1)))
+
+            # Predictions
+            if show_predictions and len(stock_data) > 60:
+                model, scaler = train_lstm_model(stock_data["Close"].values)
+                
+                # Get the last 60 days to predict the next day
+                last_60_days = stock_data["Close"].values[-60:].reshape(-1, 1)
+                last_60_days_scaled = scaler.transform(last_60_days)
+                
+                X_test = np.array([last_60_days_scaled])
+                X_test = np.reshape(X_test, (X_test.shape[0], X_test.shape[1], 1))
+                
+                pred_price_scaled = model.predict(X_test)
+                pred_price = scaler.inverse_transform(pred_price_scaled)
+
+                # Add a point for tomorrow's forecast
+                tomorrow = stock_data.index[-1] + pd.Timedelta(days=1)
+                fig.add_trace(go.Scatter(
+                    x=[stock_data.index[-1], tomorrow], 
+                    y=[stock_data["Close"].iloc[-1], pred_price[0][0]],
+                    mode="lines+markers", name=f"{stock} Forecast",
+                    line=dict(dash="dash", color="cyan")
+                ))
+
+    st.plotly_chart(fig, use_container_width=True)
+
+    # Volatility Table
+    st.subheader("📊 Volatility & Valuation")
+    valuation_rows = []
+    for stock in selected_stocks:
+        data = get_stock_data(stock)
+        vol = calculate_volatility(data)
+        pe, ind_pe = get_stock_fundamentals(stock)
+        status = is_stock_overpriced(pe, ind_pe)
+        valuation_rows.append([stock, f"{vol:.2f}%", pe, ind_pe, status])
+
+    df_val = pd.DataFrame(valuation_rows, columns=["Stock", "Volatility", "P/E Ratio", "Industry P/E", "Status"])
+    st.table(df_val)
+
+    # News & Sentiment
+    col1, col2 = st.columns(2)
+    with col1:
+        st.header("📰 Market News")
+        m_news = scrape_google_news("Stock Market Today")
+        for txt, link in m_news:
+            st.markdown(f"📌 [{txt}]({link})")
     
-    # Candlestick Chart
-    fig.add_trace(go.Candlestick(
-        x=stock_data.index,
-        open=stock_data['Open'],
-        high=stock_data['High'],
-        low=stock_data['Low'],
-        close=stock_data['Close'],
-        name=f"{stock} Historical"
-    ))
+    with col2:
+        st.header("📢 Sentiment")
+        sent = analyze_sentiment(m_news)
+        emoji = "🟢" if sent > 0.05 else "🔴" if sent < -0.05 else "🟡"
+        st.metric("AI Market Sentiment", f"{emoji} {sent:.2f}")
 
-    # Moving Averages for trend clarity
-    stock_data["MA_50"] = stock_data["Close"].rolling(window=50).mean()
-    stock_data["MA_200"] = stock_data["Close"].rolling(window=200).mean()
-
-    fig.add_trace(go.Scatter(
-        x=stock_data.index, y=stock_data["MA_50"],
-        mode="lines", name=f"{stock} 50-Day MA",
-        line=dict(color="orange", dash="dot")
-    ))
-
-    fig.add_trace(go.Scatter(
-        x=stock_data.index, y=stock_data["MA_200"],
-        mode="lines", name=f"{stock} 200-Day MA",
-        line=dict(color="purple", dash="dot")
-    ))
-
-    # LSTM Predictions
-    model, scaler = train_lstm_model(stock_data)
-    scaled_data = scaler.transform(stock_data["Close"].values.reshape(-1, 1))
-    X_test = np.array([scaled_data[-60:].flatten()])
-    X_test = np.reshape(X_test, (X_test.shape[0], X_test.shape[1], 1))
-    predictions = scaler.inverse_transform(model.predict(X_test))
-
-    future_dates = pd.date_range(stock_data.index[-1], periods=8)[1:]
-    fig.add_trace(go.Scatter(
-        x=future_dates, y=predictions.flatten(),
-        mode="lines", name=f"{stock} Forecast",
-        line=dict(color="blue", dash="dash")
-    ))
-
-st.plotly_chart(fig, use_container_width=True, height=700)
-
-# Stock Valuation Table
-st.subheader("📊 Stock Volatility & Overpricing Analysis")
-valuation_data = []
-
-for stock in selected_stocks:
-    stock_data = get_stock_data(stock)
-    volatility = calculate_volatility(stock_data)
-    pe_ratio, industry_avg = get_stock_fundamentals(stock)
-    pricing_status = is_stock_overpriced(pe_ratio, industry_avg)
-
-    valuation_data.append([stock, f"{volatility:.2f}%", pe_ratio, industry_avg, pricing_status])
-
-df_valuation = pd.DataFrame(valuation_data, columns=["Stock", "Volatility", "P/E Ratio", "Industry P/E", "Status"])
-st.dataframe(df_valuation)
-
-# Market Sentiment
-st.header("📰 Market-Wide Financial News")
-market_news = scrape_google_news("Stock Market Today")
-for news, url in market_news:
-    st.markdown(f"📌 [{news}]({url})")
-
-market_sentiment = analyze_sentiment(market_news)
-sentiment_emoji = "🟢" if market_sentiment > 0 else "🔴" if market_sentiment < 0 else "🟡"
-st.subheader(f"📢 AI Market Sentiment: {sentiment_emoji} {market_sentiment:.2f}")
-
-# Trending Stocks
-st.subheader("Live Trending Stocks")
-trending_stocks = scrape_google_news("Trending Stocks")
-for news, url in trending_stocks:
-    st.markdown(f"📌 [{news}]({url})")
+    st.subheader("🔥 Trending")
+    t_news = scrape_google_news("Trending Stocks")
+    for txt, link in t_news:
+        st.caption(f"🔥 [{txt}]({link})")
